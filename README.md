@@ -1,0 +1,1 @@
+This project uses an ESP32-S3 to read battery voltage using a voltage divider, read the speed of a motor by monitoring a phase line, control turn signals by actuating relays, monitor battery discharge and charging current, and communicate with a smartphone to report all the recorded information to a live interface.
