@@ -1,10 +1,5 @@
 #![no_std]
 #![no_main]
-#![deny(
-    clippy::mem_forget,
-    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
-    holding buffers for the duration of a data transfer."
-)]
 
 use embassy_executor::Spawner;
 use esp_backtrace as _;
@@ -13,7 +8,7 @@ use esp_hal::{clock::CpuClock, rmt::Rmt, time::Rate, timer::timg::TimerGroup};
 use esp_hal_smartled::{smart_led_buffer, SmartLedsAdapter};
 use esp_radio::ble::controller::BleConnector;
 use esp_storage::FlashStorage;
-use log::{info, warn};
+use log::{error, info, warn};
 use smart_leds::{
     brightness, gamma,
     hsv::{hsv2rgb, Hsv},
@@ -23,7 +18,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 use core::ops::Range;
 use embassy_futures::join::join;
 use embassy_futures::select::select;
-use embassy_time::{Duration, Timer};
+use embassy_time::Timer;
 use embedded_storage_async::nor_flash::NorFlash;
 use rand_core::{CryptoRng, RngCore};
 use sequential_storage::cache::NoCache;
@@ -113,7 +108,7 @@ const L2CAP_CHANNELS_MAX: usize = 4; // Signal + att
 #[gatt_server]
 struct Server {
     battery_service: BatteryService,
-    hid_service: HidService,
+    _hid_service: HidService,
 }
 
 static DESC: [u8; 67] = [
@@ -329,8 +324,6 @@ where
                     info!("Connection dropped");
                 }
                 Err(e) => {
-                    #[cfg(feature = "defmt")]
-                    let e = defmt::Debug2Format(&e);
                     panic!("[adv] error: {:?}", e);
                 }
             }
@@ -357,8 +350,6 @@ where
 async fn ble_task<C: Controller, P: PacketPool>(mut runner: Runner<'_, C, P>) {
     loop {
         if let Err(e) = runner.run().await {
-            #[cfg(feature = "defmt")]
-            let e = defmt::Debug2Format(&e);
             panic!("[ble_task] error: {:?}", e);
         }
     }
@@ -378,7 +369,6 @@ async fn gatt_events_task<S: NorFlash>(
     let reason = loop {
         match conn.next().await {
             GattConnectionEvent::Disconnected { reason } => break reason,
-            #[cfg(feature = "security")]
             GattConnectionEvent::PairingComplete {
                 security_level,
                 bond,
@@ -390,7 +380,6 @@ async fn gatt_events_task<S: NorFlash>(
                     info!("Bond information stored");
                 }
             }
-            #[cfg(feature = "security")]
             GattConnectionEvent::PairingFailed(err) => {
                 error!("[gatt] pairing error: {:?}", err);
             }
@@ -401,14 +390,11 @@ async fn gatt_events_task<S: NorFlash>(
                             let value = server.get(&level);
                             info!("[gatt] Read Event to Level Characteristic: {:?}", value);
                         }
-                        #[cfg(feature = "security")]
                         if conn.raw().security_level()?.encrypted() {
                             None
                         } else {
                             Some(AttErrorCode::INSUFFICIENT_ENCRYPTION)
                         }
-                        #[cfg(not(feature = "security"))]
-                        None
                     }
                     GattEvent::Write(event) => {
                         if event.handle() == level.handle {
@@ -417,14 +403,11 @@ async fn gatt_events_task<S: NorFlash>(
                                 event.data()
                             );
                         }
-                        #[cfg(feature = "security")]
                         if conn.raw().security_level()?.encrypted() {
                             None
                         } else {
                             Some(AttErrorCode::INSUFFICIENT_ENCRYPTION)
                         }
-                        #[cfg(not(feature = "security"))]
-                        None
                     }
                     _ => None,
                 };
