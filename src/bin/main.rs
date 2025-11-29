@@ -3,26 +3,35 @@
 
 use embassy_executor::Spawner;
 use esp_backtrace as _;
-use esp_hal::rng::{Trng, TrngSource};
-use esp_hal::{clock::CpuClock, rmt::Rmt, time::Rate, timer::timg::TimerGroup};
-use esp_hal_smartled::{smart_led_buffer, SmartLedsAdapter};
+use esp_hal::{
+    clock::CpuClock,
+    efuse::Efuse,
+    rmt::{PulseCode, Rmt},
+    rng::{Trng, TrngSource},
+    time::Rate,
+    timer::timg::TimerGroup,
+};
+use esp_hal_smartled::SmartLedsAdapter;
 use esp_radio::ble::controller::BleConnector;
 use esp_storage::FlashStorage;
 use log::{error, info, warn};
 use smart_leds::{
     brightness, gamma,
     hsv::{hsv2rgb, Hsv},
-    SmartLedsWrite, RGB8,
+    SmartLedsWrite,
 };
 esp_bootloader_esp_idf::esp_app_desc!();
 use core::ops::Range;
 use embassy_futures::join::join;
 use embassy_futures::select::select;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::Timer;
 use embedded_storage_async::nor_flash::NorFlash;
 use rand_core::{CryptoRng, RngCore};
 use sequential_storage::cache::NoCache;
 use sequential_storage::map::{Key, SerializationError, Value};
+use static_cell::StaticCell;
 use trouble_host::prelude::*;
 
 #[panic_handler]
@@ -44,12 +53,16 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+static RMT_BUFFER_SIZE: usize = 32;
+static RMT_BUFFER: StaticCell<[PulseCode; RMT_BUFFER_SIZE]> = StaticCell::new();
+static LED_ENABLE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     // esp_println::logger::init_logger_from_env();
     esp_println::logger::init_logger(log::LevelFilter::Info);
     info!("Creating heap allocator");
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 128 * 1024);
     info!("Creating config");
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     info!("Taking peripherals");
@@ -63,15 +76,11 @@ async fn main(_spawner: Spawner) {
         Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT");
     let rmt_channel = rmt.channel0;
     info!("Creating LED buffer");
-    let mut rmt_buffer = smart_led_buffer!(1);
+    // let mut rmt_buffer = smart_led_buffer!(1);
     info!("Creating LED adapter");
-    let mut led = SmartLedsAdapter::new(rmt_channel, peripherals.GPIO48, &mut rmt_buffer);
-    let mut color = Hsv {
-        hue: 0,
-        sat: 255,
-        val: 255,
-    };
-    let mut data: RGB8;
+    // In main:
+    let rmt_buffer = RMT_BUFFER.init([PulseCode::default(); RMT_BUFFER_SIZE]);
+    let led = SmartLedsAdapter::new(rmt_channel, peripherals.GPIO48, rmt_buffer);
     let level = 255;
     info!("Initializing the bluetooth stack");
     let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
@@ -84,15 +93,47 @@ async fn main(_spawner: Spawner) {
     let mut flash =
         embassy_embedded_hal::adapter::BlockingAsync::new(FlashStorage::new(peripherals.FLASH));
 
+    info!("Spawning LED task");
+    spawner.spawn(led_task(led, level)).ok();
+    info!("Running controller");
     run(controller, &mut trng, &mut flash).await;
+}
 
-    info!("Starting loop");
+#[embassy_executor::task]
+async fn led_task(mut led: SmartLedsAdapter<'static, RMT_BUFFER_SIZE>, level: u8) {
+    let mut color = Hsv {
+        hue: 0,
+        sat: 255,
+        val: 255,
+    };
+
     loop {
+        // Wait for LED to be enabled
+        // Check if LED should be disabled (non-blocking check)
+        if let Some(enabled) = LED_ENABLE.try_take() {
+            if !enabled {
+                // LED disabled, wait until re-enabled
+                loop {
+                    if let Some(true) = LED_ENABLE.try_take() {
+                        break;
+                    }
+                    Timer::after_millis(50).await;
+                }
+            }
+        }
         for hue in 0..=255 {
+            // Check if we should stop
+            if LED_ENABLE.signaled() {
+                break;
+            }
+
             color.hue = hue;
-            data = hsv2rgb(color);
-            led.write(brightness(gamma([data].into_iter()), level))
-                .unwrap();
+            let data = hsv2rgb(color);
+            if let Err(e) = led.write(brightness(gamma([data].into_iter()), level)) {
+                warn!("LED write error: {:?}", e);
+                Timer::after_millis(100).await; // Back off on error
+                continue;
+            }
             Timer::after_millis(5).await;
         }
     }
@@ -145,8 +186,19 @@ struct BatteryService {
     #[descriptor(uuid = descriptors::MEASUREMENT_DESCRIPTION, name = "hello", read, value = "Battery Level")]
     #[characteristic(uuid = characteristic::BATTERY_LEVEL, read, notify, value = 10)]
     level: u8,
-    #[characteristic(uuid = "408813df-5dd4-1f87-ec11-cdb001100000", write, read, notify)]
-    status: bool,
+
+    // #[characteristic(uuid = "408813df-5dd4-1f87-ec11-cdb001100000", write, read, notify)]
+    // status: bool,
+    // Changed to support variable-length data and added write_without_response
+    #[characteristic(
+        uuid = "408813df-5dd4-1f87-ec11-cdb001100000",
+        write,
+        write_without_response,
+        read,
+        notify,
+        value = [0u8; 128]
+    )]
+    status: [u8; 128], // Support up to 128 bytes
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +248,7 @@ impl<'a> Value<'a> for StoredBondInformation {
         if buffer.len() < 17 {
             Err(SerializationError::BufferTooSmall)
         } else {
+            // NOTE: This unwrap can cause a panic. How can it fail?
             let ltk = LongTermKey::from_le_bytes(buffer[0..16].try_into().unwrap());
             let security_level = match buffer[16] {
                 0 => SecurityLevel::NoEncryption,
@@ -223,6 +276,7 @@ async fn store_bonding_info<S: NorFlash>(
     info: &BondInformation,
 ) -> Result<(), sequential_storage::Error<S::Error>> {
     // Use flash range from 640KB, should be good for both ESP32 & nRF52840 examples
+    // NOTE: What if the data section overwrites this? Is it possible?
     let start_addr = 0xA0000 as u32;
     let storage_range = start_addr..(start_addr + 8 * S::ERASE_SIZE as u32);
     sequential_storage::erase_all(storage, storage_range.clone()).await?;
@@ -241,6 +295,10 @@ async fn store_bonding_info<S: NorFlash>(
         &value,
     )
     .await?;
+    info!(
+        "Stored bonding information with Long Term Key {}.",
+        info.ltk
+    );
     Ok(())
 }
 
@@ -278,7 +336,15 @@ where
 {
     // Using a fixed "random" address can be useful for testing. In real scenarios, one would
     // use e.g. the MAC 6 byte array as the address (how to get that varies by the platform).
-    let address: Address = Address::random([0xff, 0x8f, 0x08, 0x05, 0xe4, 0xff]);
+    // TODO: Use the actual MAC address
+    let mac = Efuse::read_base_mac_address();
+    info!(
+        "MAC address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    let mut ble_mac = mac;
+    ble_mac[5] = ble_mac[5].wrapping_add(2);
+    let address: Address = Address::random(ble_mac);
     info!("Our address = {}", address);
 
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
@@ -304,14 +370,14 @@ where
 
     info!("Starting advertising and GATT service");
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-        name: "TrouBLE",
+        name: "Nathaniel's Ebike",
         appearance: &appearance::human_interface_device::GENERIC_HUMAN_INTERFACE_DEVICE,
     }))
     .unwrap();
 
     let _ = join(ble_task(runner), async {
         loop {
-            match advertise("Trouble Example", &mut peripheral, &server).await {
+            match advertise("Nathaniel's eBike", &mut peripheral, &server).await {
                 Ok(conn) => {
                     // Allow bondable if no bond is stored.
                     conn.raw().set_bondable(!bond_stored).unwrap();
@@ -366,6 +432,8 @@ async fn gatt_events_task<S: NorFlash>(
     bond_stored: &mut bool,
 ) -> Result<(), Error> {
     let level = server.battery_service.level;
+    let status = server.battery_service.status; // Add this line
+
     let reason = loop {
         match conn.next().await {
             GattConnectionEvent::Disconnected { reason } => break reason,
@@ -397,12 +465,33 @@ async fn gatt_events_task<S: NorFlash>(
                         }
                     }
                     GattEvent::Write(event) => {
-                        if event.handle() == level.handle {
-                            info!(
-                                "[gatt] Write Event to Level Characteristic: {:?}",
-                                event.data()
-                            );
+                        // Handle writes to the status characteristic
+                        if event.handle() == status.handle {
+                            let data = event.data();
+                            if let Ok(text) = core::str::from_utf8(data) {
+                                info!("[RECEIVED] Text message: '{}'", text);
+                            } else {
+                                info!(
+                                    "[RECEIVED] Binary data ({} bytes): {:02x?}",
+                                    data.len(),
+                                    data
+                                );
+                            }
                         }
+                        // Handle writes to the level characteristic
+                        else if event.handle() == level.handle {
+                            let data = event.data();
+                            if let Ok(note) = core::str::from_utf8(data) {
+                                info!("[gatt] Received note: '{}'", note);
+                            } else {
+                                info!(
+                                    "[gatt] Received binary data ({} bytes): {:02x?}",
+                                    data.len(),
+                                    data
+                                );
+                            }
+                        }
+
                         if conn.raw().security_level()?.encrypted() {
                             None
                         } else {
@@ -428,7 +517,6 @@ async fn gatt_events_task<S: NorFlash>(
     info!("[gatt] disconnected: {:?}", reason);
     Ok(())
 }
-
 /// Create an advertiser to use to connect to a BLE Central, and wait for it to connect.
 async fn advertise<'values, 'server, C: Controller>(
     name: &'values str,
